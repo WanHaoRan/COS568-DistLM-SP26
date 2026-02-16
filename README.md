@@ -108,7 +108,7 @@ Now, instead of writing your own gradient synchronization, use the distributed f
 
 ## Part 4: Benchmarking Data Parallel Training
 
-In this section, your task is to benchmark and profile the communication aspect of data parallel training and analyze the synchronization overhead for three communication methods (gather/scatter, all_reduce, and DDP). Similar to A1, you should use the `torch.profiler.profile` to record the profiling data during the training. In this part, you are required to profile **three training steps** for each communication method. Please use `torch.profiler.schedule()` to schedule the profiling, and skip the first training step. Here is an example of the profiling result:
+In this section, your task is to benchmark and profile the communication aspect of data parallel training and analyze the synchronization overhead for three communication methods (`gather/scatter`, `all_reduce`, and `DDP`). Similar to A1, you should use the `torch.profiler.profile` to record the profiling data during the training. In this part, you are required to profile **three training steps** for each communication method. Please use `torch.profiler.schedule()` to schedule the profiling, and skip the first training step. Here is an example of the profiling result:
 ![Profiler Result](figures/dist_training.svg)
 
 **Task 4:** Add the profiling code to your training code in Task 2(a), 2(b) and 3, and save the profiling data of three training steps to a chrome trace file. Then, use the chrome browser to visualize the profiling data and analyze the communication overhead. 
@@ -120,7 +120,7 @@ A *brief* report in PDF format (filename: `$NetID$_$firstname$_$lastname$.pdf`) 
 In the report, include the following content:
 - Task 1: Run experiements for 3 epochs and report the evaluation metric after every epoch.
 - Task 2, 3: Run each task for 1 epoch rather than 3 epochs. Discard the timings of the first iteration and report the average time per iteration for the remaining iterations for each task (2(a), 2(b), and 3). To time your code, see [this](https://realpython.com/python-timer/). Log the loss curve for each node (The loss curve should be *exactly* the same for Task 2(a) and 2(b))
-- Task 4: Report the profiling data of three training steps for each communication method and analyze the communication overhead. Skip the first training step. Report the percentage of the communication time overhead out of the total time for each step. 
+- Task 4: Report the profiling data of three training steps for each communication method and analyze the communication overhead. Skip the first training step. Report the percentage of the communication time overhead out of the total time for each step. Compare the `all_reduce` and `DDP` methods, and discuss why `DDP` is more efficient, and in what percentage.
 - Reason about the difference (or the lack of difference) among different setups. Feel free to refer to the [PyTorch Distributed [VLDB '18]](https://arxiv.org/pdf/2006.15704.pdf) paper for more context.
 - Comment on the scalability of distributed ML based on your results.
 - Provide any implementation details.
