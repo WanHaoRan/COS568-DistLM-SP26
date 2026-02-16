@@ -108,7 +108,7 @@ Now, instead of writing your own gradient synchronization, use the distributed f
 
 ## Part 4: Benchmarking Data Parallel Training
 
-In this section, your task is to benchmark and profile the communication aspect of data parallel training and analyze the synchronization overhead for three communication methods (`gather/scatter`, `all_reduce`, and `DDP`). Similar to A1, you should use the `torch.profiler.profile` to record the profiling data during the training. In this part, you are required to profile **three training steps** for each communication method. Please use `torch.profiler.schedule()` to schedule the profiling, and skip the first training step. Here is an example of the profiling result:
+In this section, your task is to benchmark and profile the communication aspect of data parallel training and analyze the synchronization overhead for three communication methods (`gather/scatter`, `all_reduce`, and `DDP`). Similar to A1, you should use the `torch.profiler.profile` to record the profiling data during the training. In this part, you are required to profile **three training steps** for each communication method. Please use `torch.profiler.schedule()` to schedule the profiling, and skip the first training step. Here is an example of the profiling result on a CPU cluster:
 ![Profiler Result](figures/dist_training.svg)
 
 **Task 4:** Add the profiling code to your training code in Task 2(a), 2(b) and 3, and save the profiling data of three training steps to a chrome trace file. Then, use the chrome browser to visualize the profiling data and analyze the communication overhead. 
