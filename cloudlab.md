@@ -37,7 +37,7 @@ To run experiments efficiently, we suggest to follow the workflow below:
    ```
 
 3. (Need to run every time when you start a new experiment) For each node, clone your git repo to your home directory. **Please don't use the shared space for your assignment.**
-4. (Need to run every time when you start a new experiment) Download GLUE/RTE data in your home directory: `python3 download_glue_data.py --data_dir ~/glue_data`.
+4. (Need to run every time when you start a new experiment) Download GLUE/RTE data in your home directory on every node: `python3 download_glue_data.py --data_dir ~/glue_data`.
 
 
 ## Policies on Using CloudLab Resources
