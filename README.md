@@ -19,7 +19,7 @@ You may choose to either use GPUs or CPUs for this project (**Using CPUs via Clo
 
 **The following setup process caters to CPU-only environments.** Note that this assignment is best done if you have bare-metal access to your compute nodes (i.e. you can access the nodes using a terminal not through a Slurm scheduler). **We highly recommend you use CPU nodes on CloudLab** -- For instructions on accessing CloudLab, see [cloudlab.md](cloudlab.md).
 
-- Create a fork of this repository and clone your own fork, please clone your repo on the path that is shared across all the nodes (e.g. `/proj/cos568proj2-PG0/groups/${your_net_id}`). **Again, please read [cloudlab.md](cloudlab.md) carefully before you clone the repo and start the experiments!**
+- Create a fork of this repository and clone your own fork, please clone your repo on the path that is shared across all the nodes (e.g. each node's home directory). **Again, please read [cloudlab.md](cloudlab.md) carefully before you clone the repo and start the experiments!**
 - Install software dependencies via apt and install pip dependencies **for each node**: 
   ```bash
   sudo apt-get update
@@ -31,7 +31,7 @@ You may choose to either use GPUs or CPUs for this project (**Using CPUs via Clo
   pip install numpy scipy scikit-learn tqdm pytorch_transformers apex
   ```
   - If you are using GPUs, install the appropriate PyTorch [here](https://pytorch.org/get-started/locally/).
--  You are only required to fine-tune RTE  (one of the datasets within GLUE) in this assignment, which has been downloaded in `/proj/cos568proj2-PG0/glue_data`. If you are not running experiments via CloudLab, use this command to download datasets within GLUE: 
+-  You are only required to fine-tune RTE  (one of the datasets within GLUE) in this assignment, use the python script `download_glue_data.py` to download the dataset. If you are not running experiments via CloudLab, use this command to download datasets within GLUE: 
     ```bash
     mkdir glue_data
     python3 download_glue_data.py --data_dir glue_data
@@ -45,7 +45,7 @@ We have provided a base script ([`run_glue_skeleton.py`](run_glue_skeleton.py)) 
 Here is a command you can use to run `run_glue.py` (remember to rename the `run_glue_skeleton.py` to `run_glue.py` after adding the necessary code):
 
 ```shell
-export GLUE_DIR=/proj/cos568proj2-PG0/glue_data
+export GLUE_DIR=$HOME/glue_data
 export TASK_NAME=RTE
 
 python3 run_glue.py \
@@ -106,11 +106,12 @@ Now, instead of writing your own gradient synchronization, use the distributed f
 
 **Task 3:** Register your model with [distributed data parallel](https://pytorch.org/docs/master/generated/torch.nn.parallel.DistributedDataParallel.html#torch.nn.parallel.DistributedDataParallel) and perform distributed training. Unlike in Part 2, you will not need to read the gradients for each layer as DistributedDataParallel performs these steps automatically. For more details, read [here](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html).
 
-## [Optional] Part 4: Benchmarking Data Parallel Training
+## Part 4: Benchmarking Data Parallel Training
 
-In this optional section, your task is to benchmark and profile the communication aspect of data parallel training and observe how application-level hyperparameters (e.g. batch size and precision level) affect system performance. In your code for task 2(b), before you perform an `torch.distributed.all_reduce`, record the shape/dimension and the data type (e.g. `float32`) of the tensor being communicated between nodes. Given this information, you should be able to calculate the size of the tensor in bytes (`size_in_bytes = num_elements * element_size`). Next, record the total amount of network traffic over an epoch. The expected amount of network traffic should equal `num_iterations * traffic_per_iteration` due to the iterative nature of ML training. You can do this by using Linux CLI tools like [dstat](https://linux.die.net/man/1/dstat) to generate network traffic statistics and export them into a csv file. Other similar tools include [tshark](https://www.wireshark.org/docs/man-pages/tshark.html), [tcpdump](https://www.tcpdump.org/manpages/tcpdump.1.html), etc.
+In this section, your task is to benchmark and profile the communication aspect of data parallel training and analyze the synchronization overhead for three communication methods (gather/scatter, all_reduce, and DDP). Similar to A1, you should use the `torch.profiler.profile` to record the profiling data during the training. In this part, you are required to profile **three training steps** for each communication method. Please use `torch.profiler.schedule()` to schedule the profiling, and skip the first training step. Here is an example of the profiling result:
+![Profiler Result](figures/dist_training.svg)
 
-**Task 4:** Adjust the batch size (e.g. reduce it from 64 to 32 and 16) and observe how the network traffic (aggregated over an epoch) and tensor size (for every `torch.distributed.all_reduce`) changes. Compare your observed traffic with the expected amount of traffic. Reason about the difference (or the lack of difference) of training runs with different batch sizes.
+**Task 4:** Add the profiling code to your training code in Task 2(a), 2(b) and 3, and save the profiling data to a chrome trace file. Then, use the chrome browser to visualize the profiling data and analyze the communication overhead. 
 
 ## Deliverables
 
