@@ -21,14 +21,15 @@ DDP handles gradient synchronization automatically as part of the backward pass
 handling is required here.
 
 Run with:
-  python run_glue.py [other args] \
-      --master_ip 10.10.1.1 --master_port 12345 \
+  python run_glue_3.py [other args] \
+      --master_ip <ip> --master_port <port> \
       --world_size 4 --local_rank <0|1|2|3>
 """
 
 from __future__ import absolute_import, division, print_function
 
 import argparse
+import contextlib
 import logging
 import os
 import random
@@ -36,10 +37,20 @@ import time
 
 import numpy as np
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import (DataLoader, SequentialSampler, TensorDataset)
+from torch.profiler import profile, ProfilerActivity, schedule
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
+
+from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
+                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm, trange
 
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
@@ -58,8 +69,7 @@ from utils_glue import (compute_metrics, convert_examples_to_features,
 
 logger = logging.getLogger(__name__)
 
-ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in
-                  (BertConfig, XLNetConfig, XLMConfig, RobertaConfig)), ())
+ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig, XLMConfig, RobertaConfig)), ())
 
 MODEL_CLASSES = {
     'bert':    (BertConfig,    BertForSequenceClassification,   BertTokenizer),
@@ -82,172 +92,213 @@ def train(args, train_dataset, model, tokenizer):
     """
     Train with PyTorch DistributedDataParallel.
 
-    The model is wrapped in DDP, which automatically synchronizes gradients
-    across all workers during the backward pass via efficient all-reduce
-    (overlapping communication with computation layer-by-layer).
+    The model is wrapped in DDP before train() is called, which automatically
+    synchronizes gradients across all workers during the backward pass via
+    efficient all-reduce (overlapping communication with computation layer-by-layer).
     No manual gradient aggregation is needed.
     """
 
     args.train_batch_size = args.per_device_train_batch_size
-
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=args.world_size,
-        rank=args.local_rank,
-        shuffle=True,
-    )
-    train_dataloader = DataLoader(
-        train_dataset,
-        sampler=train_sampler,
-        batch_size=args.train_batch_size,
-    )
+    if args.master_ip is not None:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    else:
+        train_sampler = RandomSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
         t_total = args.max_steps
-        args.num_train_epochs = (args.max_steps //
-                                 (len(train_dataloader) // args.gradient_accumulation_steps) + 1)
+        args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
     else:
-        t_total = (len(train_dataloader) //
-                   args.gradient_accumulation_steps * args.num_train_epochs)
+        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters()
-                    if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay},
-        {'params': [p for n, p in model.named_parameters()
-                    if any(nd in n for nd in no_decay)],
-         'weight_decay': 0.0},
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
     ]
-    optimizer = AdamW(optimizer_grouped_parameters,
-                      lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = WarmupLinearSchedule(optimizer,
-                                     warmup_steps=args.warmup_steps,
-                                     t_total=t_total)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
     if args.fp16:
         try:
             from apex import amp
         except ImportError:
-            raise ImportError("Please install apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer,
-                                          opt_level=args.fp16_opt_level)
-
-    # model is already wrapped with DDP in main() before train() is called
-    ddp_model = model
+            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
     logger.info("***** Running training (Task 3: DDP) *****")
     logger.info("  Num examples        = %d", len(train_dataset))
     logger.info("  Num Epochs          = %d", args.num_train_epochs)
     logger.info("  Per-device batch    = %d", args.per_device_train_batch_size)
     logger.info("  World size          = %d", args.world_size)
-    logger.info("  Total batch size    = %d",
-                args.train_batch_size * args.world_size * args.gradient_accumulation_steps)
+    logger.info("  Total batch size    = %d", args.train_batch_size * args.world_size * args.gradient_accumulation_steps)
     logger.info("  Total optim steps   = %d", t_total)
 
     global_step = 0
     tr_loss = 0.0
-    ddp_model.zero_grad()
+    model.zero_grad()
+    rank = torch.distributed.get_rank() if args.master_ip is not None else 0
 
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch",
-                            disable=args.local_rank not in [-1, 0])
+    # Timing: first iteration discarded, then average reported
+    iter_times = []
+    loss_curve = []
+    step_loss_accum = 0.0
+    t_iter_start = None
+
+    # Task 4: profiling
+    trace_addr = None
+    if args.profile:
+        os.makedirs(args.output_dir, exist_ok=True)
+        trace_addr = os.path.join(args.output_dir, "chrome_trace_part3_rank{}.json".format(rank))
+        sched = schedule(wait=1, warmup=0, active=3, repeat=1)
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA] if (torch.cuda.is_available() and not args.no_cuda) else [ProfilerActivity.CPU]
+        prof_context = profile(
+            activities=activities,
+            schedule=sched,
+            on_trace_ready=lambda p: p.export_chrome_trace(trace_addr),
+        )
+        logger.info("[Task 4] Profiling enabled. Trace will be saved to %s", trace_addr)
+    else:
+        prof_context = contextlib.nullcontext(enter_result=None)
+
+    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)
 
-    iter_times = []
+    with prof_context as prof:
+        for epoch in train_iterator:
+            if args.master_ip is not None:
+                train_sampler.set_epoch(epoch)
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+            for step, batch in enumerate(epoch_iterator):
+                if step % args.gradient_accumulation_steps == 0:
+                    t_iter_start = time.perf_counter()
+                    step_loss_accum = 0.0
 
-    for epoch_idx in train_iterator:
-        train_sampler.set_epoch(epoch_idx)
+                model.train()
+                batch = tuple(t.to(args.device) for t in batch)
+                inputs = {
+                    'input_ids':      batch[0],
+                    'attention_mask': batch[1],
+                    'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+                    'labels':         batch[3],
+                }
 
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration",
-                              disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            iter_start = time.time()
+                is_update_step = ((step + 1) % args.gradient_accumulation_steps == 0) or ((step + 1) == len(train_dataloader))
+                use_no_sync = (args.master_ip is not None) and (not is_update_step)
 
-            ddp_model.train()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {
-                'input_ids':      batch[0],
-                'attention_mask': batch[1],
-                'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
-                'labels':         batch[3],
-            }
-            outputs = ddp_model(**inputs)
-            loss = outputs[0]
+                if use_no_sync:
+                    with model.no_sync():
+                        outputs = model(**inputs)
+                        loss = outputs[0]
+                        if args.gradient_accumulation_steps > 1:
+                            loss = loss / args.gradient_accumulation_steps
+                        if args.fp16:
+                            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                                scaled_loss.backward()
+                        else:
+                            loss.backward()
+                else:
+                    outputs = model(**inputs)
+                    loss = outputs[0]
+                    if args.gradient_accumulation_steps > 1:
+                        loss = loss / args.gradient_accumulation_steps
+                    if args.fp16:
+                        with amp.scale_loss(loss, optimizer) as scaled_loss:
+                            scaled_loss.backward()
+                    else:
+                        # DDP hooks fire during backward and automatically all-reduce
+                        # gradients across workers before backward() returns.
+                        loss.backward()
 
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+                tr_loss += loss.item()
+                step_loss_accum += loss.item()
 
-            if args.fp16:
-                from apex import amp
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer),
-                                               args.max_grad_norm)
-            else:
-                # DDP hooks fire during backward and automatically all-reduce
-                # gradients across workers before backward() returns.
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(),
-                                               args.max_grad_norm)
+                if step < 5:
+                    logger.info("  [rank %d] step %d loss = %.4f", args.local_rank, step, loss.item())
 
-            tr_loss += loss.item()
+                if is_update_step:
+                    if args.fp16:
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    iter_times.append(time.perf_counter() - t_iter_start)
+                    loss_curve.append((global_step + 1, step_loss_accum))
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
+                    global_step += 1
+                    if prof is not None:
+                        prof.step()
+                        if torch.cuda.is_available() and not args.no_cuda:
+                            torch.cuda.synchronize()
 
-            if step < 5:
-                logger.info("  [rank %d] step %d loss = %.4f",
-                            args.local_rank, step, loss.item())
-
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                # No manual gradient sync needed — DDP has already done it.
-                optimizer.step()
-                scheduler.step()
-                ddp_model.zero_grad()
-                global_step += 1
-
-            iter_end = time.time()
-            if step > 0:
-                iter_times.append(iter_end - iter_start)
+                if args.max_steps > 0 and global_step > args.max_steps:
+                    epoch_iterator.close()
+                    break
 
             if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
+                train_iterator.close()
                 break
 
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
+            # Evaluate after each epoch on rank 0 only — DDP ensures all workers
+            # have identical model weights, so rank 0 evaluation is representative.
+            if args.do_eval and args.local_rank in [-1, 0]:
+                evaluate(args, model, tokenizer, prefix="epoch_{}".format(epoch + 1))
 
-        # Evaluate on rank 0 only (the underlying model weights are identical
-        # on all workers after DDP sync)
-        if args.local_rank in [-1, 0]:
-            evaluate(args, model, tokenizer,
-                     prefix="epoch_{}".format(epoch_idx + 1))
+    if trace_addr is not None:
+        logger.info("[Task 4] Trace saved at %s (open in Chrome: chrome://tracing)", trace_addr)
 
-    if iter_times:
-        avg_iter_time = sum(iter_times) / len(iter_times)
-        logger.info("  [rank %d] Avg iteration time (excl. first) = %.4f s",
-                    args.local_rank, avg_iter_time)
+    # Save timing and loss curve to files
+    os.makedirs(args.output_dir, exist_ok=True)
+    if len(iter_times) > 1:
+        avg_time_per_iter = sum(iter_times[1:]) / (len(iter_times) - 1)
+        logger.info("[Task 3] Rank %d: avg iter time (excl. first): %.4f sec (%d iters)",
+                    rank, avg_time_per_iter, len(iter_times) - 1)
+        with open(os.path.join(args.output_dir, "avg_time_part3_rank{}.txt".format(rank)), "w") as f:
+            f.write("rank\tavg_time_per_iter_sec\tnum_iterations\n")
+            f.write("%d\t%.6f\t%d\n" % (rank, avg_time_per_iter, len(iter_times) - 1))
+
+    with open(os.path.join(args.output_dir, "loss_curve_part3_rank{}.txt".format(rank)), "w") as f:
+        f.write("step\tloss\n")
+        for s, l in loss_curve:
+            f.write("%d\t%.6f\n" % (s, l))
+    logger.info("[Task 3] Rank %d: loss curve written to %s", rank,
+                os.path.join(args.output_dir, "loss_curve_part3_rank{}.txt".format(rank)))
+
+    if loss_curve and _HAS_MATPLOTLIB:
+        steps = [s for s, _ in loss_curve]
+        losses = [l for _, l in loss_curve]
+        plt.figure(figsize=(8, 5))
+        plt.plot(steps, losses, "b-", linewidth=1)
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Training loss (rank {})".format(rank))
+        plt.grid(True, alpha=0.3)
+        plot_path = os.path.join(args.output_dir, "loss_curve_part3_rank{}.png".format(rank))
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+    elif loss_curve and not _HAS_MATPLOTLIB:
+        logger.warning("matplotlib not available; skipping loss curve plot.")
 
     return global_step, tr_loss / global_step
 
 
 def evaluate(args, model, tokenizer, prefix=""):
-    """Evaluate on the dev set. Always call on the unwrapped model."""
-    eval_task_names = (("mnli", "mnli-mm") if args.task_name == "mnli"
-                       else (args.task_name,))
-    eval_outputs_dirs = ((args.output_dir, args.output_dir + '-MM')
-                         if args.task_name == "mnli"
-                         else (args.output_dir,))
+    eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
+    eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
-        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer,
-                                               evaluate=True)
+        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
 
         args.eval_batch_size = args.per_device_eval_batch_size
         eval_sampler = SequentialSampler(eval_dataset)
-        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler,
-                                     batch_size=args.eval_batch_size)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
         logger.info("***** Running evaluation %s *****", prefix)
         logger.info("  Num examples = %d", len(eval_dataset))
@@ -277,9 +328,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                 out_label_ids = inputs['labels'].detach().cpu().numpy()
             else:
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-                out_label_ids = np.append(out_label_ids,
-                                          inputs['labels'].detach().cpu().numpy(),
-                                          axis=0)
+                out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
 
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
@@ -300,21 +349,18 @@ def evaluate(args, model, tokenizer, prefix=""):
 
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
-    if args.local_rank not in [-1, 0]:
-        dist.barrier()
+    # Only block non-rank-0 workers during training-time cache creation
+    if (not evaluate) and args.master_ip is not None and args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
 
     processor = processors[task]()
     output_mode = output_modes[task]
+    cached_features_file = os.path.join(args.data_dir, 'cached_{}_{}_{}_{}'.format(
+        'dev' if evaluate else 'train',
+        list(filter(None, args.model_name_or_path.split('/'))).pop(),
+        str(args.max_seq_length),
+        str(task)))
 
-    cached_features_file = os.path.join(
-        args.data_dir,
-        'cached_{}_{}_{}_{}'.format(
-            'dev' if evaluate else 'train',
-            list(filter(None, args.model_name_or_path.split('/'))).pop(),
-            str(args.max_seq_length),
-            str(task),
-        )
-    )
     if os.path.exists(cached_features_file):
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
@@ -323,8 +369,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         label_list = processor.get_labels()
         if task in ['mnli', 'mnli-mm'] and args.model_type in ['roberta']:
             label_list[1], label_list[2] = label_list[2], label_list[1]
-        examples = (processor.get_dev_examples(args.data_dir) if evaluate
-                    else processor.get_train_examples(args.data_dir))
+        examples = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
         features = convert_examples_to_features(
             examples, label_list, args.max_seq_length, tokenizer, output_mode,
             cls_token_at_end=bool(args.model_type in ['xlnet']),
@@ -340,94 +385,101 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
 
-    if args.local_rank == 0:
-        dist.barrier()
+    # Release non-rank-0 workers after rank 0 finishes writing the cache
+    if (not evaluate) and args.master_ip is not None and args.local_rank == 0:
+        torch.distributed.barrier()
 
-    all_input_ids   = torch.tensor([f.input_ids   for f in features], dtype=torch.long)
-    all_input_mask  = torch.tensor([f.input_mask  for f in features], dtype=torch.long)
+    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
     if output_mode == "classification":
         all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
     elif output_mode == "regression":
         all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
 
-    return TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+    dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+    return dataset
 
 
 def main():
     parser = argparse.ArgumentParser()
 
-    # Required
-    parser.add_argument("--data_dir",          required=True, type=str)
-    parser.add_argument("--model_type",         required=True, type=str)
-    parser.add_argument("--model_name_or_path", required=True, type=str)
-    parser.add_argument("--task_name",          required=True, type=str)
-    parser.add_argument("--output_dir",         required=True, type=str)
+    ## Required parameters
+    parser.add_argument("--data_dir", default=None, type=str, required=True)
+    parser.add_argument("--model_type", default=None, type=str, required=True)
+    parser.add_argument("--model_name_or_path", default=None, type=str, required=True)
+    parser.add_argument("--task_name", default=None, type=str, required=True)
+    parser.add_argument("--output_dir", default=None, type=str, required=True)
 
-    # Optional
-    parser.add_argument("--config_name",    default="",    type=str)
-    parser.add_argument("--tokenizer_name", default="",    type=str)
-    parser.add_argument("--cache_dir",      default="",    type=str)
-    parser.add_argument("--max_seq_length", default=128,   type=int)
-    parser.add_argument("--do_train",       action='store_true')
-    parser.add_argument("--do_eval",        action='store_true')
-    parser.add_argument("--do_lower_case",  action='store_true')
-    parser.add_argument("--per_device_train_batch_size", default=8,   type=int)
-    parser.add_argument("--per_device_eval_batch_size",  default=8,   type=int)
-    parser.add_argument("--gradient_accumulation_steps", default=1,   type=int)
-    parser.add_argument("--learning_rate",  default=5e-5,  type=float)
-    parser.add_argument("--weight_decay",   default=0.0,   type=float)
-    parser.add_argument("--adam_epsilon",   default=1e-8,  type=float)
-    parser.add_argument("--max_grad_norm",  default=1.0,   type=float)
+    ## Other parameters
+    parser.add_argument("--config_name", default="", type=str)
+    parser.add_argument("--tokenizer_name", default="", type=str)
+    parser.add_argument("--cache_dir", default="", type=str)
+    parser.add_argument("--max_seq_length", default=128, type=int)
+    parser.add_argument("--do_train", action='store_true')
+    parser.add_argument("--do_eval", action='store_true')
+    parser.add_argument("--do_lower_case", action='store_true')
+    parser.add_argument("--per_device_train_batch_size", default=8, type=int)
+    parser.add_argument("--per_device_eval_batch_size", default=8, type=int)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument("--learning_rate", default=5e-5, type=float)
+    parser.add_argument("--weight_decay", default=0.0, type=float)
+    parser.add_argument("--adam_epsilon", default=1e-8, type=float)
+    parser.add_argument("--max_grad_norm", default=1.0, type=float)
     parser.add_argument("--num_train_epochs", default=3.0, type=float)
-    parser.add_argument("--max_steps",      default=-1,    type=int)
-    parser.add_argument("--warmup_steps",   default=0,     type=int)
-    parser.add_argument("--no_cuda",        action='store_true')
-    parser.add_argument("--overwrite_output_dir", action='store_true')
-    parser.add_argument("--overwrite_cache",      action='store_true')
-    parser.add_argument("--seed",           default=42,    type=int)
-    parser.add_argument("--fp16",           action='store_true')
-    parser.add_argument("--fp16_opt_level", default='O1',  type=str)
+    parser.add_argument("--max_steps", default=-1, type=int)
+    parser.add_argument("--warmup_steps", default=0, type=int)
+    parser.add_argument("--no_cuda", action='store_true')
+    parser.add_argument('--overwrite_output_dir', action='store_true')
+    parser.add_argument('--overwrite_cache', action='store_true')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--fp16', action='store_true')
+    parser.add_argument('--fp16_opt_level', type=str, default='O1')
+    parser.add_argument("--local_rank", type=int, default=-1)
 
-    # Distributed
-    parser.add_argument("--local_rank",  type=int, default=-1)
-    parser.add_argument("--master_ip",   type=str, default="127.0.0.1")
-    parser.add_argument("--master_port", type=str, default="12345")
-    parser.add_argument("--world_size",  type=int, default=1)
+    ## Distributed training
+    parser.add_argument("--master_ip", default=None, type=str,
+                        help="Master node IP. If set, init_process_group is called.")
+    parser.add_argument("--master_port", default=29500, type=int)
+    parser.add_argument("--world_size", default=1, type=int)
+
+    ## Task 4: profiling
+    parser.add_argument("--profile", action="store_true", default=False,
+                        help="Profile 3 training steps (skip first), save Chrome trace.")
 
     args = parser.parse_args()
 
-    if (os.path.exists(args.output_dir) and os.listdir(args.output_dir)
-            and args.do_train and not args.overwrite_output_dir):
-        raise ValueError(
-            "Output directory ({}) already exists. Use --overwrite_output_dir.".format(
-                args.output_dir))
-
-    # ----- Distributed init -----
-    if args.local_rank != -1:
-        backend = 'nccl' if (torch.cuda.is_available() and not args.no_cuda) else 'gloo'
-        dist.init_process_group(
+    # Initialize distributed process group
+    if args.master_ip is not None:
+        backend = "nccl" if torch.cuda.is_available() and not args.no_cuda else "gloo"
+        torch.distributed.init_process_group(
             backend=backend,
             init_method="tcp://{}:{}".format(args.master_ip, args.master_port),
             world_size=args.world_size,
             rank=args.local_rank,
         )
-        logger.info("Distributed init done: rank=%d, world_size=%d, backend=%s",
-                    args.local_rank, args.world_size, backend)
-    # ----------------------------
 
-    args.device = torch.device(
-        "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    args.n_gpu = torch.cuda.device_count()
+    if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
+        raise ValueError("Output directory ({}) already exists. Use --overwrite_output_dir.".format(args.output_dir))
+
+    # Device setup
+    if torch.cuda.is_available() and not args.no_cuda:
+        if args.master_ip is not None:
+            torch.cuda.set_device(0)
+            args.device = torch.device("cuda:0")
+        else:
+            args.device = torch.device("cuda")
+    else:
+        args.device = torch.device("cpu")
+    args.n_gpu = torch.cuda.device_count() if (torch.cuda.is_available() and not args.no_cuda) else 0
 
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
     )
-    logger.warning("rank=%s, device=%s, distributed=%s, fp16=%s",
-                   args.local_rank, args.device,
-                   bool(args.local_rank != -1), args.fp16)
+    logger.warning("Process rank: %s, device: %s, distributed training: %s, 16-bits training: %s",
+                   args.local_rank, args.device, bool(args.local_rank != -1), args.fp16)
 
     set_seed(args)
 
@@ -439,8 +491,9 @@ def main():
     label_list = processor.get_labels()
     num_labels = len(label_list)
 
+    # Only rank 0 downloads model; others wait
     if args.local_rank not in [-1, 0]:
-        dist.barrier()
+        torch.distributed.barrier()
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
@@ -453,12 +506,12 @@ def main():
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:
-        dist.barrier()
+        torch.distributed.barrier()
 
     model.to(args.device)
 
-    if args.local_rank != -1:
-        if torch.cuda.is_available() and not args.no_cuda:
+    if args.master_ip is not None:
+        if args.device.type == "cuda":
             model = DDP(model, device_ids=[0], output_device=0)
         else:
             model = DDP(model)
@@ -466,11 +519,12 @@ def main():
     logger.info("Training/evaluation parameters %s", args)
 
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer,
-                                                evaluate=False)
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
-        logger.info("global_step=%s, avg_loss=%s", global_step, tr_loss)
+        logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
+    # Final evaluation on rank 0 only — no barrier needed since train() already
+    # handles per-epoch eval and all ranks have exited the training loop cleanly.
     if args.do_eval and args.local_rank in [-1, 0]:
         evaluate(args, model, tokenizer, prefix="final")
 
