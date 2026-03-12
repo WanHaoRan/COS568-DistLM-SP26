@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Part 2(b): Distributed Data Parallel Training with all_reduce gradient synchronization.
+Part 2(a): Distributed Data Parallel Training with gather/scatter gradient synchronization.
 
 Run with:
   python run_glue.py [other args] \
@@ -22,13 +22,13 @@ Run with:
       --world_size 4 --local_rank <0|1|2|3>
 
 With world_size=4 and per_device_train_batch_size=16, total batch size = 64,
-matching Task 1 and Task 2(a). With the same seed, loss curves should be
-identical to Task 2(a).
+matching the single-node run from Task 1.
 """
 
 from __future__ import absolute_import, division, print_function
 
 import argparse
+import contextlib
 import logging
 import os
 import random
@@ -37,9 +37,18 @@ import time
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.profiler import profile, ProfilerActivity, schedule
 from torch.utils.data import (DataLoader, SequentialSampler, TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
 
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
                                   BertForSequenceClassification, BertTokenizer,
@@ -77,39 +86,43 @@ def set_seed(args):
     torch.cuda.manual_seed_all(args.seed)
 
 
-def sync_gradients_all_reduce(model, args):
+def sync_gradients_gather_scatter(model, world_size, rank):
     """
-    Gradient synchronization using all_reduce.
-
-    Calls dist.all_reduce (SUM) on every parameter gradient, then divides
-    by world_size to produce the global mean gradient on every worker.
+    Gradient synchronization using gather + scatter.
+    Worker 0 gathers all gradients, averages them, scatters back to all workers.
     """
-    world_size = args.world_size
     for param in model.parameters():
         if param.grad is None:
             continue
-        # Sum gradients across all workers in-place
-        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-        # Divide to get the mean
-        param.grad.data /= world_size
+        # Gather all gradients to rank 0
+        if rank == 0:
+            gather_list = [torch.empty_like(param.grad) for _ in range(world_size)]
+        else:
+            gather_list = None
+        dist.gather(param.grad, gather_list=gather_list, dst=0)
+
+        # Rank 0 averages and prepares scatter
+        if rank == 0:
+            mean_grad = torch.stack(gather_list).mean(dim=0)
+            scatter_list = [mean_grad.clone() for _ in range(world_size)]
+        else:
+            scatter_list = None
+
+        # Scatter averaged gradient back to all workers
+        dist.scatter(param.grad, scatter_list=scatter_list, src=0)
 
 
 def train(args, train_dataset, model, tokenizer):
-    """Train the model with all_reduce gradient synchronization."""
+    """Train the model with gather/scatter gradient synchronization."""
 
     args.train_batch_size = args.per_device_train_batch_size
+    world_size = dist.get_world_size() if args.local_rank != -1 else 1
+    rank = dist.get_rank() if args.local_rank != -1 else 0
 
     train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=args.world_size,
-        rank=args.local_rank,
-        shuffle=True,
-    )
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_dataloader = DataLoader(
-        train_dataset,
-        sampler=train_sampler,
-        batch_size=args.train_batch_size,
-    )
+        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -122,128 +135,149 @@ def train(args, train_dataset, model, tokenizer):
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters()
-                    if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay},
+                    if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters()
-                    if any(nd in n for nd in no_decay)],
-         'weight_decay': 0.0},
+                    if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
     ]
-    optimizer = AdamW(optimizer_grouped_parameters,
-                      lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = WarmupLinearSchedule(optimizer,
-                                     warmup_steps=args.warmup_steps,
-                                     t_total=t_total)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer,
-                                          opt_level=args.fp16_opt_level)
-
-    logger.info("***** Running training (Task 2b: all_reduce) *****")
-    logger.info("  Num examples        = %d", len(train_dataset))
-    logger.info("  Num Epochs          = %d", args.num_train_epochs)
-    logger.info("  Per-device batch    = %d", args.per_device_train_batch_size)
-    logger.info("  World size          = %d", args.world_size)
-    logger.info("  Total batch size    = %d",
-                args.train_batch_size * args.world_size * args.gradient_accumulation_steps)
-    logger.info("  Total optim steps   = %d", t_total)
+    logger.info("***** Running training (Task 2a: gather/scatter) *****")
+    logger.info("  Num examples = %d", len(train_dataset))
+    logger.info("  Num Epochs = %d", args.num_train_epochs)
+    logger.info("  Per-device batch = %d", args.per_device_train_batch_size)
+    logger.info("  World size = %d", world_size)
+    logger.info("  Total batch size = %d", args.train_batch_size * world_size)
+    logger.info("  Total optim steps = %d", t_total)
 
     global_step = 0
     tr_loss = 0.0
     model.zero_grad()
 
+    # Timing (perf_counter for high resolution); discard first iteration
+    iter_times = []
+    # Loss curve: list of (step, loss)
+    loss_curve = []
+
+    # Task 4: profiling — skip 1 step, profile 3 steps, save chrome trace
+    os.makedirs(args.output_dir, exist_ok=True)
+    trace_path = os.path.join(args.output_dir, "chrome_trace_task2a_rank{}.json".format(rank))
+    prof_schedule = schedule(wait=1, warmup=0, active=3, repeat=1)
+    activities = ([ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                  if (torch.cuda.is_available() and not args.no_cuda)
+                  else [ProfilerActivity.CPU])
+    prof_context = profile(
+        activities=activities,
+        schedule=prof_schedule,
+        on_trace_ready=lambda p: p.export_chrome_trace(trace_path),
+    )
+    logger.info("[Task 4] Chrome trace will be saved to %s", trace_path)
+
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch",
                             disable=args.local_rank not in [-1, 0])
     set_seed(args)
 
-    iter_times = []
+    with prof_context as prof:
+        for epoch_idx in train_iterator:
+            train_sampler.set_epoch(epoch_idx)
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration",
+                                  disable=args.local_rank not in [-1, 0])
 
-    for epoch_idx in train_iterator:
-        train_sampler.set_epoch(epoch_idx)
+            for step, batch in enumerate(epoch_iterator):
+                t_start = time.perf_counter()
 
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration",
-                              disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            iter_start = time.time()
+                model.train()
+                batch = tuple(t.to(args.device) for t in batch)
+                inputs = {
+                    'input_ids':      batch[0],
+                    'attention_mask': batch[1],
+                    'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+                    'labels':         batch[3],
+                }
+                outputs = model(**inputs)
+                loss = outputs[0]
 
-            model.train()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {
-                'input_ids':      batch[0],
-                'attention_mask': batch[1],
-                'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
-                'labels':         batch[3],
-            }
-            outputs = model(**inputs)
-            loss = outputs[0]
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
 
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-
-            if args.fp16:
-                from apex import amp
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer),
-                                               args.max_grad_norm)
-            else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(),
-                                               args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                tr_loss += loss.item()
 
-            tr_loss += loss.item()
+                if step < 5:
+                    logger.info("  [rank %d] step %d loss = %.4f", rank, step, loss.item())
 
-            if step < 5:
-                logger.info("  [rank %d] step %d loss = %.4f",
-                            args.local_rank, step, loss.item())
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    # ---- Gradient synchronization via gather/scatter ----
+                    if args.local_rank != -1:
+                        sync_gradients_gather_scatter(model, world_size, rank)
+                    # -----------------------------------------------------
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
+                    global_step += 1
+                    loss_curve.append((global_step, loss.item()))
+                    if prof is not None:
+                        prof.step()
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                # ---- Gradient synchronization via all_reduce ----
-                sync_gradients_all_reduce(model, args)
-                # -------------------------------------------------
-                optimizer.step()
-                scheduler.step()
-                model.zero_grad()
-                global_step += 1
+                elapsed = time.perf_counter() - t_start
+                if step > 0:
+                    iter_times.append(elapsed)
 
-            iter_end = time.time()
-            if step > 0:
-                iter_times.append(iter_end - iter_start)
+                if args.max_steps > 0 and global_step > args.max_steps:
+                    epoch_iterator.close()
+                    break
 
             if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
+                train_iterator.close()
                 break
 
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
+            # Save timing and loss BEFORE barrier so data is preserved even if a node drops
+            if iter_times:
+                avg_iter_time = sum(iter_times) / len(iter_times)
+                logger.info("  [rank %d] Avg iteration time (excl. first) = %.4f s", rank, avg_iter_time)
+                timing_path = os.path.join(args.output_dir, "avg_time_task2a_rank{}.txt".format(rank))
+                with open(timing_path, "w") as f:
+                    f.write("rank\tavg_time_per_iter_sec\tnum_iters\n")
+                    f.write("{}\t{:.6f}\t{}\n".format(rank, avg_iter_time, len(iter_times)))
 
-        if args.local_rank in [-1, 0]:
-            evaluate(args, model, tokenizer,
-                     prefix="epoch_{}".format(epoch_idx + 1))
+            loss_path = os.path.join(args.output_dir, "loss_curve_task2a_rank{}.txt".format(rank))
+            with open(loss_path, "w") as f:
+                f.write("step\tloss\n")
+                for s, l in loss_curve:
+                    f.write("{}\t{:.6f}\n".format(s, l))
+            logger.info("  [rank %d] Loss curve saved to %s", rank, loss_path)
 
-    if iter_times:
-        avg_iter_time = sum(iter_times) / len(iter_times)
-        logger.info("  [rank %d] Avg iteration time (excl. first) = %.4f s",
-                    args.local_rank, avg_iter_time)
+            # Only rank 0 evaluates; no barrier needed after epoch
+            if args.local_rank in [-1, 0]:
+                evaluate(args, model, tokenizer, prefix="epoch_{}".format(epoch_idx + 1))
+
+    # Plot loss curve
+    if loss_curve and _HAS_MATPLOTLIB:
+        steps  = [s for s, _ in loss_curve]
+        losses = [l for _, l in loss_curve]
+        plt.figure(figsize=(8, 5))
+        plt.plot(steps, losses, "b-", linewidth=1)
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Task 2a Training Loss (rank {})".format(rank))
+        plt.grid(True, alpha=0.3)
+        plot_path = os.path.join(args.output_dir, "loss_curve_task2a_rank{}.png".format(rank))
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("  [rank %d] Loss curve plot saved to %s", rank, plot_path)
 
     return global_step, tr_loss / global_step
 
 
 def evaluate(args, model, tokenizer, prefix=""):
-    eval_task_names = (("mnli", "mnli-mm") if args.task_name == "mnli"
-                       else (args.task_name,))
+    eval_task_names = (("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,))
     eval_outputs_dirs = ((args.output_dir, args.output_dir + '-MM')
-                         if args.task_name == "mnli"
-                         else (args.output_dir,))
+                         if args.task_name == "mnli" else (args.output_dir,))
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
-        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer,
-                                               evaluate=True)
+        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
 
@@ -253,9 +287,6 @@ def evaluate(args, model, tokenizer, prefix=""):
                                      batch_size=args.eval_batch_size)
 
         logger.info("***** Running evaluation %s *****", prefix)
-        logger.info("  Num examples = %d", len(eval_dataset))
-        logger.info("  Batch size   = %d", args.eval_batch_size)
-
         eval_loss = 0.0
         nb_eval_steps = 0
         preds = None
@@ -281,8 +312,7 @@ def evaluate(args, model, tokenizer, prefix=""):
             else:
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids,
-                                          inputs['labels'].detach().cpu().numpy(),
-                                          axis=0)
+                                          inputs['labels'].detach().cpu().numpy(), axis=0)
 
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
@@ -303,21 +333,16 @@ def evaluate(args, model, tokenizer, prefix=""):
 
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
-    if args.local_rank not in [-1, 0]:
-        dist.barrier()
+    # Barriers removed — cache already exists on all nodes
 
     processor = processors[task]()
     output_mode = output_modes[task]
-
     cached_features_file = os.path.join(
-        args.data_dir,
-        'cached_{}_{}_{}_{}'.format(
+        args.data_dir, 'cached_{}_{}_{}_{}'.format(
             'dev' if evaluate else 'train',
             list(filter(None, args.model_name_or_path.split('/'))).pop(),
-            str(args.max_seq_length),
-            str(task),
-        )
-    )
+            str(args.max_seq_length), str(task)))
+
     if os.path.exists(cached_features_file):
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
@@ -340,11 +365,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
             pad_token_segment_id=4 if args.model_type in ['xlnet'] else 0,
         )
         if args.local_rank in [-1, 0]:
-            logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
-
-    if args.local_rank == 0:
-        dist.barrier()
 
     all_input_ids   = torch.tensor([f.input_ids   for f in features], dtype=torch.long)
     all_input_mask  = torch.tensor([f.input_mask  for f in features], dtype=torch.long)
@@ -402,11 +423,10 @@ def main():
 
     if (os.path.exists(args.output_dir) and os.listdir(args.output_dir)
             and args.do_train and not args.overwrite_output_dir):
-        raise ValueError(
-            "Output directory ({}) already exists. Use --overwrite_output_dir.".format(
-                args.output_dir))
+        raise ValueError("Output directory ({}) already exists. Use --overwrite_output_dir.".format(
+            args.output_dir))
 
-    # ----- Distributed init -----
+    # Distributed init
     if args.local_rank != -1:
         backend = 'nccl' if (torch.cuda.is_available() and not args.no_cuda) else 'gloo'
         dist.init_process_group(
@@ -415,12 +435,8 @@ def main():
             world_size=args.world_size,
             rank=args.local_rank,
         )
-        logger.info("Distributed init done: rank=%d, world_size=%d, backend=%s",
-                    args.local_rank, args.world_size, backend)
-    # ----------------------------
 
-    args.device = torch.device(
-        "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
     logging.basicConfig(
@@ -428,9 +444,6 @@ def main():
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
     )
-    logger.warning("rank=%s, device=%s, distributed=%s, fp16=%s",
-                   args.local_rank, args.device,
-                   bool(args.local_rank != -1), args.fp16)
 
     set_seed(args)
 
@@ -459,11 +472,9 @@ def main():
         dist.barrier()
 
     model.to(args.device)
-    logger.info("Training/evaluation parameters %s", args)
 
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer,
-                                                evaluate=False)
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info("global_step=%s, avg_loss=%s", global_step, tr_loss)
 
