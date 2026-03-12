@@ -232,30 +232,25 @@ def train(args, train_dataset, model, tokenizer):
                 train_iterator.close()
                 break
 
-            # Barrier before/after eval to avoid race conditions
-            if args.local_rank != -1:
-                dist.barrier()
+            # Save timing and loss BEFORE barrier so data is preserved even if a node drops
+            if iter_times:
+                avg_iter_time = sum(iter_times) / len(iter_times)
+                logger.info("  [rank %d] Avg iteration time (excl. first) = %.4f s", rank, avg_iter_time)
+                timing_path = os.path.join(args.output_dir, "avg_time_task2a_rank{}.txt".format(rank))
+                with open(timing_path, "w") as f:
+                    f.write("rank\tavg_time_per_iter_sec\tnum_iters\n")
+                    f.write("{}\t{:.6f}\t{}\n".format(rank, avg_iter_time, len(iter_times)))
+
+            loss_path = os.path.join(args.output_dir, "loss_curve_task2a_rank{}.txt".format(rank))
+            with open(loss_path, "w") as f:
+                f.write("step\tloss\n")
+                for s, l in loss_curve:
+                    f.write("{}\t{:.6f}\n".format(s, l))
+            logger.info("  [rank %d] Loss curve saved to %s", rank, loss_path)
+
+            # Only rank 0 evaluates; no barrier needed after epoch
             if args.local_rank in [-1, 0]:
                 evaluate(args, model, tokenizer, prefix="epoch_{}".format(epoch_idx + 1))
-            if args.local_rank != -1:
-                dist.barrier()
-
-    # Save timing
-    if iter_times:
-        avg_iter_time = sum(iter_times) / len(iter_times)
-        logger.info("  [rank %d] Avg iteration time (excl. first) = %.4f s", rank, avg_iter_time)
-        timing_path = os.path.join(args.output_dir, "avg_time_task2a_rank{}.txt".format(rank))
-        with open(timing_path, "w") as f:
-            f.write("rank\tavg_time_per_iter_sec\tnum_iters\n")
-            f.write("{}\t{:.6f}\t{}\n".format(rank, avg_iter_time, len(iter_times)))
-
-    # Save loss curve
-    loss_path = os.path.join(args.output_dir, "loss_curve_task2a_rank{}.txt".format(rank))
-    with open(loss_path, "w") as f:
-        f.write("step\tloss\n")
-        for s, l in loss_curve:
-            f.write("{}\t{:.6f}\n".format(s, l))
-    logger.info("  [rank %d] Loss curve saved to %s", rank, loss_path)
 
     # Plot loss curve
     if loss_curve and _HAS_MATPLOTLIB:
