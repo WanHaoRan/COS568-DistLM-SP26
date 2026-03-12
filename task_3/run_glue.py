@@ -133,15 +133,8 @@ def train(args, train_dataset, model, tokenizer):
         model, optimizer = amp.initialize(model, optimizer,
                                           opt_level=args.fp16_opt_level)
 
-    # ---- Wrap model with DistributedDataParallel ----
-    # DDP requires specifying the device_ids for GPU training.
-    # For CPU training (device_ids=None), omit device_ids.
-    if torch.cuda.is_available() and not args.no_cuda:
-        ddp_model = DDP(model, device_ids=[args.local_rank],
-                        output_device=args.local_rank)
-    else:
-        ddp_model = DDP(model)
-    # --------------------------------------------------
+    # model is already wrapped with DDP in main() before train() is called
+    ddp_model = model
 
     logger.info("***** Running training (Task 3: DDP) *****")
     logger.info("  Num examples        = %d", len(train_dataset))
@@ -463,6 +456,13 @@ def main():
         dist.barrier()
 
     model.to(args.device)
+
+    if args.local_rank != -1:
+        if torch.cuda.is_available() and not args.no_cuda:
+            model = DDP(model, device_ids=[0], output_device=0)
+        else:
+            model = DDP(model)
+
     logger.info("Training/evaluation parameters %s", args)
 
     if args.do_train:
