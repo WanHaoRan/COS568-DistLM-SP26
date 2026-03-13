@@ -354,9 +354,7 @@ def evaluate(args, model, tokenizer, prefix=""):
 
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
-    # FIX: barrier applies to ALL distributed calls (train and eval), not just train.
-    # Without this, non-rank-0 nodes can race to read the eval cache before rank 0 writes it.
-    if args.master_ip is not None and args.local_rank not in [-1, 0]:
+    if (not evaluate) and args.master_ip is not None and args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
     processor = processors[task]()
@@ -391,7 +389,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
 
-    if args.master_ip is not None and args.local_rank == 0:
+    if (not evaluate) and args.master_ip is not None and args.local_rank == 0:
         torch.distributed.barrier()
 
     # Convert to Tensors and build dataset
