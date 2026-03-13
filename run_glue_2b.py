@@ -161,7 +161,7 @@ def train(args, train_dataset, model, tokenizer):
 
     # Task 4: profiling — skip 1 step, profile 3 steps, save chrome trace
     os.makedirs(args.output_dir, exist_ok=True)
-    trace_path = os.path.join(args.output_dir, "chrome_trace_task2a_rank{}.json".format(rank))
+    trace_path = os.path.join(args.output_dir, "chrome_trace_task2b_rank{}.json".format(rank))
     prof_schedule = schedule(wait=1, warmup=0, active=3, repeat=1)
     activities = ([ProfilerActivity.CPU, ProfilerActivity.CUDA]
                   if (torch.cuda.is_available() and not args.no_cuda)
