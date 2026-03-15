@@ -18,15 +18,26 @@
 from __future__ import absolute_import, division, print_function
 
 import argparse
+import contextlib
 import glob
 import logging
 import os
 import random
+import time  # Use time.perf_counter() for timing; see https://realpython.com/python-timer/
 
 import numpy as np
 import torch
-from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
-                              TensorDataset)
+from torch.profiler import profile, ProfilerActivity, schedule
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # Non-interactive backend for headless / server
+    import matplotlib.pyplot as plt
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
+
+from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler, TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
@@ -67,11 +78,43 @@ def set_seed(args):
     torch.cuda.manual_seed_all(args.seed)
 
 
+def sync_gradients(model, world_size, rank):
+    """
+    Gather gradients from all workers to rank 0, compute element-wise mean,
+    then scatter the mean gradient back to all workers (Task 2a).
+    Uses torch.distributed.gather and torch.distributed.scatter (gloo/nccl).
+    """
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        # Gather: all ranks send p.grad to rank 0
+        if rank == 0:
+            gather_list = [torch.empty_like(p.grad) for _ in range(world_size)]
+        else:
+            gather_list = None
+        torch.distributed.gather(p.grad, gather_list, dst=0)
+        # Rank 0: average
+        if rank == 0:
+            mean_grad = torch.stack(gather_list).mean(dim=0)
+            scatter_list = [mean_grad.clone() for _ in range(world_size)]
+        else:
+            scatter_list = None
+        # Scatter: rank 0 sends mean_grad to every rank (into p.grad)
+        torch.distributed.scatter(p.grad, scatter_list, src=0)
+
+
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+    if args.master_ip is not None:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
+    else:
+        world_size = 1
+        rank = 0
+        train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -108,55 +151,141 @@ def train(args, train_dataset, model, tokenizer):
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
+
+    # Timing via time.perf_counter() (high resolution); first iteration discarded, then average.
+    # Ref: https://realpython.com/python-timer/
+    iter_times = []
+    loss_curve = []  # (step, loss) per node for plotting
+    step_loss_accum = 0.0
+    t_iter_start = None
+
+    # Task 4: Profiling — skip 1st step, profile 3 steps, save Chrome trace.
+    # FIX: default=False so profiling only runs when --profile is explicitly passed.
+    trace_addr = None
+    if args.profile:
+        os.makedirs(args.output_dir, exist_ok=True)
+        trace_addr = os.path.join(args.output_dir, "chrome_trace_part2a_rank{}.json".format(rank))
+        sched = schedule(wait=1, warmup=0, active=3, repeat=1)
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA] if (torch.cuda.is_available() and not args.no_cuda) else [ProfilerActivity.CPU]
+        prof_context = profile(
+            activities=activities,
+            schedule=sched,
+            on_trace_ready=lambda p: p.export_chrome_trace(trace_addr),
+        )
+        logger.info("[Task 4] Profiling enabled (skip 1 step, profile 3 steps). Trace will be saved to %s", trace_addr)
+    else:
+        prof_context = contextlib.nullcontext(enter_result=None)
+
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            model.train()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
-                      'labels':         batch[3]}
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+    with prof_context as prof:
+        for epoch in train_iterator:
+            if args.master_ip is not None:
+                train_sampler.set_epoch(epoch)
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+            for step, batch in enumerate(epoch_iterator):
+                # Start timer at the beginning of each accumulation cycle (perf_counter: best for short durations)
+                if step % args.gradient_accumulation_steps == 0:
+                    t_iter_start = time.perf_counter()
+                    step_loss_accum = 0.0
+                model.train()
+                batch = tuple(t.to(args.device) for t in batch)
+                inputs = {'input_ids':      batch[0],
+                          'attention_mask': batch[1],
+                          'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
+                          'labels':         batch[3]}
+                outputs = model(**inputs)
+                loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-            else:
-                ##################################################
-                # TODO(cos568): perform backward pass here (expect one line of code)
-                
-                ##################################################
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                if args.fp16:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
 
-            tr_loss += loss.item()
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                ##################################################
-                # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
-                
-                ##################################################
-                scheduler.step() # Update learning rate schedule
-                model.zero_grad()
-                global_step += 1
+                tr_loss += loss.item()
+                step_loss_accum += loss.item()
+                if ((step + 1) % args.gradient_accumulation_steps == 0) or ((step + 1) == len(train_dataloader)):
+                    # Task 2a: sync gradients (gather to rank 0, average, scatter) before clip/step
+                    if args.master_ip is not None:
+                        sync_gradients(model, world_size, rank)
+                    if args.fp16:
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    # Record iteration time (first iteration discarded when reporting average)
+                    iter_times.append(time.perf_counter() - t_iter_start)
+                    # Log loss curve: step_loss_accum is already average (we add loss/accum_steps each batch)
+                    loss_curve.append((global_step + 1, step_loss_accum))
+                    optimizer.step()
+                    scheduler.step()  # Update learning rate schedule
+                    model.zero_grad()
+                    global_step += 1
+                    # Task 4: profiler step
+                    if prof is not None:
+                        prof.step()
+                        if torch.cuda.is_available() and not args.no_cuda:
+                            torch.cuda.synchronize()
 
+                if args.max_steps > 0 and global_step > args.max_steps:
+                    epoch_iterator.close()
+                    break
             if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
+                train_iterator.close()
                 break
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
-        
-        ##################################################
-        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
 
-        ##################################################
+            # Barrier so all ranks finish the epoch before any rank enters evaluate().
+            # Otherwise rank 0 can enter eval while others are still in sync_gradients → "Connection closed by peer".
+            if args.do_eval:
+                if args.master_ip is not None:
+                    torch.distributed.barrier()
+                if args.local_rank in [-1, 0]:
+                    evaluate(args, model, tokenizer, prefix="epoch-{}".format(epoch))
+                if args.master_ip is not None:
+                    torch.distributed.barrier()
+
+    if trace_addr is not None:
+        logger.info("[Task 4] Trace file saved at %s (open in Chrome: chrome://tracing)", trace_addr)
+
+    # Report average time per iteration (discard first iteration) and save to file
+    os.makedirs(args.output_dir, exist_ok=True)
+    avg_time_path = os.path.join(args.output_dir, "avg_time_part2a_rank{}.txt".format(rank))
+    if len(iter_times) > 1:
+        avg_time_per_iter = sum(iter_times[1:]) / (len(iter_times) - 1)
+        logger.info("[Task 2(a)] Rank %s: average time per iteration (excluding first): %.4f sec (%d iterations)",
+                    rank, avg_time_per_iter, len(iter_times) - 1)
+        with open(avg_time_path, "w") as f:
+            f.write("rank\tavg_time_per_iter_sec\tnum_iterations\n")
+            f.write("%d\t%.6f\t%d\n" % (rank, avg_time_per_iter, len(iter_times) - 1))
+        logger.info("[Task 2(a)] Rank %s: avg time written to %s", rank, avg_time_path)
+
+    # Log loss curve for this node (each rank writes its own file and plot)
+    loss_curve_path = os.path.join(args.output_dir, "loss_curve_part2a_rank{}.txt".format(rank))
+    with open(loss_curve_path, "w") as f:
+        f.write("step\tloss\n")
+        for s, l in loss_curve:
+            f.write("%d\t%.6f\n" % (s, l))
+    logger.info("[Task 2(a)] Rank %s: loss curve written to %s", rank, loss_curve_path)
+
+    # Plot loss curve and save as PNG
+    if loss_curve and _HAS_MATPLOTLIB:
+        steps = [s for s, _ in loss_curve]
+        losses = [l for _, l in loss_curve]
+        plt.figure(figsize=(8, 5))
+        plt.plot(steps, losses, "b-", linewidth=1)
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Training loss (rank {})".format(rank))
+        plt.grid(True, alpha=0.3)
+        plot_path = os.path.join(args.output_dir, "loss_curve_part2a_rank{}.png".format(rank))
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("[Task 2(a)] Rank %s: loss curve plot saved to %s", rank, plot_path)
+    elif loss_curve and not _HAS_MATPLOTLIB:
+        logger.warning("matplotlib not available; skipping loss curve plot. Install with: pip install matplotlib")
 
     return global_step, tr_loss / global_step
 
@@ -174,7 +303,6 @@ def evaluate(args, model, tokenizer, prefix=""):
             os.makedirs(eval_output_dir)
 
         args.eval_batch_size = args.per_device_eval_batch_size
-        # Note that DistributedSampler samples randomly
         eval_sampler = SequentialSampler(eval_dataset)
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
@@ -193,7 +321,7 @@ def evaluate(args, model, tokenizer, prefix=""):
             with torch.no_grad():
                 inputs = {'input_ids':      batch[0],
                           'attention_mask': batch[1],
-                          'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM and RoBERTa don't use segment_ids
+                          'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
                           'labels':         batch[3]}
                 outputs = model(**inputs)
                 tmp_eval_loss, logits = outputs[:2]
@@ -226,8 +354,8 @@ def evaluate(args, model, tokenizer, prefix=""):
 
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
+    if (not evaluate) and args.master_ip is not None and args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
 
     processor = processors[task]()
     output_mode = output_modes[task]
@@ -245,15 +373,15 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         label_list = processor.get_labels()
         if task in ['mnli', 'mnli-mm'] and args.model_type in ['roberta']:
             # HACK(label indices are swapped in RoBERTa pretrained model)
-            label_list[1], label_list[2] = label_list[2], label_list[1] 
+            label_list[1], label_list[2] = label_list[2], label_list[1]
         examples = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
         features = convert_examples_to_features(examples, label_list, args.max_seq_length, tokenizer, output_mode,
-            cls_token_at_end=bool(args.model_type in ['xlnet']),            # xlnet has a cls token at the end
+            cls_token_at_end=bool(args.model_type in ['xlnet']),
             cls_token=tokenizer.cls_token,
             cls_token_segment_id=2 if args.model_type in ['xlnet'] else 0,
             sep_token=tokenizer.sep_token,
-            sep_token_extra=bool(args.model_type in ['roberta']),           # roberta uses an extra separator b/w pairs of sentences, cf. github.com/pytorch/fairseq/commit/1684e166e3da03f5b600dbb7855cb98ddfcd0805
-            pad_on_left=bool(args.model_type in ['xlnet']),                 # pad on the left for xlnet
+            sep_token_extra=bool(args.model_type in ['roberta']),
+            pad_on_left=bool(args.model_type in ['xlnet']),
             pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
             pad_token_segment_id=4 if args.model_type in ['xlnet'] else 0,
         )
@@ -261,8 +389,8 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
 
-    if args.local_rank == 0:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
+    if (not evaluate) and args.master_ip is not None and args.local_rank == 0:
+        torch.distributed.barrier()
 
     # Convert to Tensors and build dataset
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
@@ -330,8 +458,6 @@ def main():
     parser.add_argument("--warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
 
-    # parser.add_argument("--eval_all_checkpoints", action='store_true',
-    #                     help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     parser.add_argument("--no_cuda", action='store_true',
                         help="Avoid using CUDA when available")
     parser.add_argument('--overwrite_output_dir', action='store_true',
@@ -347,15 +473,43 @@ def main():
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
-                        help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+                        help="For distributed training: local_rank (global rank, e.g. 0,1,2,3 for 4 nodes). If single-node training, local_rank defaults to -1.")
+    # Distributed training (Task 2a)
+    parser.add_argument("--master_ip", default=None, type=str,
+                        help="Master node IP for distributed training. If set, init_process_group is called.")
+    parser.add_argument("--master_port", default=29500, type=int,
+                        help="Master port for distributed training.")
+    parser.add_argument("--world_size", default=1, type=int,
+                        help="Total number of workers (nodes) in distributed training.")
+    # Task 4: profiling — FIX: default=False so it only runs when --profile is explicitly passed.
+    parser.add_argument("--profile", action="store_true", default=False,
+                        help="Profile 3 training steps (skip first), save Chrome trace to output_dir.")
     args = parser.parse_args()
+
+    # Initialize distributed process group (gloo for CPU, nccl for GPU)
+    if args.master_ip is not None:
+        backend = "nccl" if torch.cuda.is_available() and not args.no_cuda else "gloo"
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method="tcp://{}:{}".format(args.master_ip, args.master_port),
+            world_size=args.world_size,
+            rank=args.local_rank,
+        )
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
     # set up (distributed) training
-    args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    args.n_gpu = torch.cuda.device_count()
+    if torch.cuda.is_available() and not args.no_cuda:
+        if args.master_ip is not None:
+            torch.cuda.set_device(0)   # one GPU per node
+            args.device = torch.device("cuda:0")
+        else:
+            args.device = torch.device("cuda")
+    else:
+        args.device = torch.device("cpu")
+
+    args.n_gpu = torch.cuda.device_count() if (torch.cuda.is_available() and not args.no_cuda) else 0
 
     # Setup logging
     logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -377,27 +531,21 @@ def main():
     num_labels = len(label_list)
 
     # Load pretrained model and tokenizer
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    if args.master_ip is not None and args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()  # Make sure only the first process downloads model & vocab
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-    
-    ##################################################
-    # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
-    # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
 
-    ##################################################
-
-    if args.local_rank == 0:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    if args.master_ip is not None and args.local_rank == 0:
+        torch.distributed.barrier()  # Make sure only the first process downloads model & vocab
 
     model.to(args.device)
 
     logger.info("Training/evaluation parameters %s", args)
-
 
     # Training
     if args.do_train:
@@ -405,8 +553,14 @@ def main():
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
-    # Evaluation
-    evaluate(args, model, tokenizer, prefix="")
+    # Evaluation (only on rank 0 in distributed mode to avoid duplicate writes)
+    if args.do_eval:
+        if args.master_ip is not None:
+            torch.distributed.barrier()
+        if args.local_rank in [-1, 0]:
+            evaluate(args, model, tokenizer, prefix="")
+        if args.master_ip is not None:
+            torch.distributed.barrier()
 
 if __name__ == "__main__":
     main()
